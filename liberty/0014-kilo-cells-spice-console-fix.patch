@@ -1,0 +1,20 @@
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 39de58c..ce7f3fa 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -4441,6 +4441,15 @@ class ComputeManager(manager.Manager):
+     @wrap_instance_fault
+     def get_spice_console(self, context, console_type, instance):
+         """Return connection information for a spice console."""
++
++        # Convert an instance dict to Instance object as needed
++        # to support operation with cells
++        if isinstance(instance, dict):
++            instance = objects.Instance._from_db_object(
++                context, objects.Instance(), instance,
++                expected_attrs=['metadata', 'system_metadata'])
++            instance._context = context
++
+         context = context.elevated()
+         LOG.debug("Getting spice console", instance=instance)
+         token = str(uuid.uuid4())

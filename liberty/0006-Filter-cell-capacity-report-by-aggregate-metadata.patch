@@ -1,0 +1,95 @@
+diff --git a/nova/cells/state.py b/nova/cells/state.py
+index ac0131e..d05b6aa 100644
+--- a/nova/cells/state.py
++++ b/nova/cells/state.py
+@@ -50,6 +50,9 @@ cell_state_manager_opts = [
+                help='Configuration file from which to read cells '
+                'configuration.  If given, overrides reading cells '
+                'from the database.'),
++    cfg.StrOpt('capacity_aggregate_key',
++               help='Aggregate key to limit capacity reporting to '
++               'certain hosts'),
+ ]
+ 
+ 
+diff --git a/nova/tests/unit/cells/test_cells_filters.py b/nova/tests/unit/cells/test_cells_filters.py
+index 4082db1..d4dfb4e 100644
+--- a/nova/tests/unit/cells/test_cells_filters.py
++++ b/nova/tests/unit/cells/test_cells_filters.py
+@@ -34,7 +34,7 @@ class FiltersTestCase(test.NoDBTestCase):
+         self.assertIn("DifferentCellFilter", class_names)
+ 
+ 
+-class _FilterTestClass(test.NoDBTestCase):
++class _FilterTestClass(test.TestCase):
+     """Base class for testing individual filter plugins."""
+     filter_cls_name = None
+ 
+diff --git a/nova/tests/unit/cells/test_cells_manager.py b/nova/tests/unit/cells/test_cells_manager.py
+index f9c98ba..1a43763 100644
+--- a/nova/tests/unit/cells/test_cells_manager.py
++++ b/nova/tests/unit/cells/test_cells_manager.py
+@@ -45,7 +45,7 @@ FAKE_TASK_LOGS = [dict(id=1, host='host1'),
+                   dict(id=2, host='host2')]
+ 
+ 
+-class CellsManagerClassTestCase(test.NoDBTestCase):
++class CellsManagerClassTestCase(test.TestCase):
+     """Test case for CellsManager class."""
+ 
+     def setUp(self):
+diff --git a/nova/tests/unit/cells/test_cells_rpc_driver.py b/nova/tests/unit/cells/test_cells_rpc_driver.py
+index 4e9894d..8ade9d6 100644
+--- a/nova/tests/unit/cells/test_cells_rpc_driver.py
++++ b/nova/tests/unit/cells/test_cells_rpc_driver.py
+@@ -34,7 +34,7 @@ CONF.import_opt('rpc_driver_queue_base', 'nova.cells.rpc_driver',
+                 group='cells')
+ 
+ 
+-class CellsRPCDriverTestCase(test.NoDBTestCase):
++class CellsRPCDriverTestCase(test.TestCase):
+     """Test case for Cells communication via RPC."""
+ 
+     def setUp(self):
+diff --git a/nova/tests/unit/cells/test_cells_state_manager.py b/nova/tests/unit/cells/test_cells_state_manager.py
+index f863061..08f05af 100644
+--- a/nova/tests/unit/cells/test_cells_state_manager.py
++++ b/nova/tests/unit/cells/test_cells_state_manager.py
+@@ -153,6 +153,37 @@ class TestCellsStateManager(test.NoDBTestCase):
+         units = 5  # 4 on host 3, 1 on host4
+         self.assertEqual(units, cap['disk_free']['units_by_mb'][str(sz)])
+ 
++    @mock.patch.object(db, 'aggregate_host_get_by_metadata_key')
++    def test_capacity_no_reserve_with_aggregate(self, mock_aggregate_host):
++        cfg.CONF.set_override('capacity_aggregate_key', 'fakekey', 'cells')
++        # Fake an aggregate containing host 1-3
++        mock_aggregate_host.return_value = {
++            'host1': set([True]),
++            'host2': set([True]),
++            'host3': set([True]),
++        }
++        fake_computes_with_aggr = FAKE_COMPUTES[:-1]
++
++        # utilize entire cell
++        cap = self._capacity(0.0)
++
++        cell_free_ram = sum(compute[3] for compute in fake_computes_with_aggr)
++        self.assertEqual(cell_free_ram, cap['ram_free']['total_mb'])
++
++        cell_free_disk = 1024 * sum(compute[4] for compute in
++                                    fake_computes_with_aggr)
++        self.assertEqual(cell_free_disk, cap['disk_free']['total_mb'])
++
++        self.assertEqual(0, cap['ram_free']['units_by_mb']['0'])
++        self.assertEqual(0, cap['disk_free']['units_by_mb']['0'])
++
++        units = cell_free_ram / 50
++        self.assertEqual(units, cap['ram_free']['units_by_mb']['50'])
++
++        sz = 25 * 1024
++        units = 4  # 4 on host 3
++        self.assertEqual(units, cap['disk_free']['units_by_mb'][str(sz)])
++
+     def test_capacity_full_reserve(self):
+         # reserve the entire cell. (utilize zero percent)
+         cap = self._capacity(100.0)

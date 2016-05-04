@@ -1,0 +1,368 @@
+diff --git a/nova/api/ec2/cloud.py b/nova/api/ec2/cloud.py
+index 632416d..328e978 100644
+--- a/nova/api/ec2/cloud.py
++++ b/nova/api/ec2/cloud.py
+@@ -294,6 +294,8 @@ class CloudController(object):
+             result.append({'zoneName': zone,
+                            'zoneState': "available"})
+         for zone in not_available_zones:
++            if zone == CONF.internal_service_availability_zone:
++                continue
+             result.append({'zoneName': zone,
+                            'zoneState': "not available"})
+         return {'availabilityZoneInfo': result}
+diff --git a/nova/api/openstack/compute/legacy_v2/contrib/availability_zone.py b/nova/api/openstack/compute/legacy_v2/contrib/availability_zone.py
+index ac655dc..ce96c8a 100644
+--- a/nova/api/openstack/compute/legacy_v2/contrib/availability_zone.py
++++ b/nova/api/openstack/compute/legacy_v2/contrib/availability_zone.py
+@@ -114,6 +114,9 @@ class AvailabilityZoneController(wsgi.Controller):
+         # NOTE(alex_xu): back-compatible with db layer hard-code admin
+         # permission checks.
+         nova_context.require_admin_context(context)
++        if CONF.cells.enable:
++            #verbose doesn't work for cells
++            return self._describe_availability_zones(context)
+         return self._describe_availability_zones_verbose(context)
+ 
+ 
+diff --git a/nova/api/openstack/compute/legacy_v2/contrib/services.py b/nova/api/openstack/compute/legacy_v2/contrib/services.py
+index c7e92db..1accd54 100644
+--- a/nova/api/openstack/compute/legacy_v2/contrib/services.py
++++ b/nova/api/openstack/compute/legacy_v2/contrib/services.py
+@@ -12,6 +12,7 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ 
++from oslo_config import cfg
+ import webob.exc
+ 
+ from nova.api.openstack import extensions
+@@ -23,6 +24,10 @@ from nova.i18n import _
+ from nova import servicegroup
+ from nova import utils
+ 
++CONF = cfg.CONF
++CONF.import_opt('enable', 'nova.cells.opts', group='cells')
++
++
+ authorize = extensions.extension_authorizer('compute', 'services')
+ 
+ 
+@@ -41,8 +46,11 @@ class ServiceController(object):
+         # permission checks
+         nova_context.require_admin_context(context)
+ 
++        set_zones = True
++        if CONF.cells.enable:
++            set_zones = True
+         services = self.host_api.service_get_all(
+-            context, set_zones=True)
++            context, set_zones=set_zones)
+ 
+         host = ''
+         if 'host' in req.GET:
+diff --git a/nova/availability_zones.py b/nova/availability_zones.py
+index 501105e..7517841 100644
+--- a/nova/availability_zones.py
++++ b/nova/availability_zones.py
+@@ -21,7 +21,9 @@ from oslo_config import cfg
+ 
+ from nova import objects
+ from nova.cells import opts as cell_opts
++from nova.cells import rpcapi as cell_rpcapi
+ from nova.openstack.common import memorycache
++from oslo_utils import timeutils
+ from nova import utils
+ 
+ # NOTE(vish): azs don't change that often, so cache them for an hour to
+@@ -39,6 +41,7 @@ availability_zone_opts = [
+     ]
+ 
+ CONF = cfg.CONF
++CONF.import_opt('mute_child_interval', 'nova.cells.opts', group='cells')
+ CONF.register_opts(availability_zone_opts)
+ 
+ 
+@@ -61,8 +64,8 @@ def reset_cache():
+     MC = None
+ 
+ 
+-def _make_cache_key(host):
+-    return "azcache-%s" % host.encode('utf-8')
++def _make_cache_key(host, cell_name=None):
++    return "azcache-%s-%s" % (cell_name or 'none', host.encode('utf-8'))
+ 
+ 
+ def _build_metadata_by_host(aggregates, hosts=None):
+@@ -129,6 +132,35 @@ def get_availability_zones(context, get_only_available=False,
+         :param with_hosts: whether to return hosts part of the AZs
+         :type with_hosts: bool
+     """
++    # Override for cells
++    cell_type = cell_opts.get_cell_type()
++    if cell_type == 'api':
++        cache = _get_cache()
++        available_zones = cache.get('az-availabile-list')
++        unavailable_zones = cache.get('az-unavailabile-list')
++
++        if not available_zones:
++            cells_rpcapi = cell_rpcapi.CellsAPI()
++            cell_info = cells_rpcapi.get_cell_info_for_neighbors(context)
++            global_azs = []
++            mute_azs = []
++            secs = CONF.cells.mute_child_interval
++            for cell in cell_info:
++                last_seen = cell['last_seen']
++                if 'availability_zones' not in cell['capabilities']:
++                    continue
++                if last_seen and timeutils.is_older_than(last_seen, secs):
++                    mute_azs.extend(cell['capabilities']['availability_zones'])
++                else:
++                    global_azs.extend(cell['capabilities']['availability_zones'])
++                available_zones = list(set(global_azs))
++                unavailable_zones = list(set(mute_azs))
++                cache.set('az-availabile-list', available_zones, 300)
++                cache.set('az-unavailabile-list', unavailable_zones, 300)
++        if get_only_available:
++            return available_zones
++        return (available_zones, unavailable_zones)
++
+     enabled_services = objects.ServiceList.get_all(context, disabled=False,
+                                                    set_zones=True)
+ 
+diff --git a/nova/cells/filters/availability_zone.py b/nova/cells/filters/availability_zone.py
+new file mode 100644
+index 0000000..1483c8c
+--- /dev/null
++++ b/nova/cells/filters/availability_zone.py
+@@ -0,0 +1,32 @@
++from nova.cells import filters
++from oslo_log import log as logging
++
++LOG = logging.getLogger(__name__)
++
++class AvailabilityZoneFilter(filters.BaseCellFilter):
++    """Filters cells by availability zone.
++
++    Works with cell capabilities using the key
++    'availability_zones'
++    Note: cell can have multiple availability zones
++    """
++
++    def cell_passes(self, cell, filter_properties):
++        LOG.debug('Filtering on availability zones for cell %s', cell)
++
++        available_zones = cell.capabilities.get('availability_zones', [])
++        LOG.debug('Availability zones: %s', available_zones)
++        spec = filter_properties.get('request_spec', {})
++        props = spec.get('instance_properties', {})
++        availability_zone = props.get('availability_zone')
++
++        if availability_zone:
++            return availability_zone in available_zones
++
++        # No AZ flag set, try deprecated scheduler hint
++        scheduler_hints = filter_properties.get('scheduler_hints', {}) or {}
++        availability_zone = scheduler_hints.get('cell', None)
++        if availability_zone:
++            return availability_zone in available_zones
++
++        return True
+diff --git a/nova/cells/scheduler.py b/nova/cells/scheduler.py
+index f625cd7..74ce418 100644
+--- a/nova/cells/scheduler.py
++++ b/nova/cells/scheduler.py
+@@ -225,6 +225,45 @@ class CellsScheduler(base.Base):
+         try:
+             for i in range(max(0, CONF.cells.scheduler_retries) + 1):
+                 try:
++                    instances = method_kwargs.get('instances', [])
++                    availability_zone = [ins.get('availability_zone', None)
++                                         for ins in instances]
++                    our_azs = self.state_manager.get_my_state()\
++                                .capabilities.get('availability_zones', [])
++
++                    parent_cell = bool(self.state_manager.get_child_cells())
++                    if not parent_cell and CONF.internal_service_availability_zone in our_azs:
++                        our_azs.remove(CONF.internal_service_availability_zone)
++
++                    if parent_cell:
++                        # Try deprecated scheduler hint
++                        if not any(availability_zone):
++                            filter_props = method_kwargs.get(
++                                'scheduler_hints', {})
++                            scheduler_hints = filter_props.get(
++                                'scheduler_hints', {})
++                            availability_zone = scheduler_hints.get(
++                                'cell', None)
++                            cell_scheduled = scheduler_hints.pop('cell', None)
++                            if scheduler_hints and cell_scheduled in our_azs:
++                                scheduler_hints.pop('cell')
++
++                    # If the instance is scheduled for our cell,
++                    # then remove the AZ from the instance.
++                    # If we're the bottom cell then the requested AZ must
++                    # be in our list of AZs. If it's not, just remove it.
++                    for instance in instances:
++                        az = instance.get('availability_zone', None)
++                        if az == None:
++                          continue
++                        if ((parent_cell and az in our_azs) or
++                                (not parent_cell and az not in our_azs)):
++                            if 'availability_zone' in instance:
++                                instance.pop('availability_zone')
++                            try:
++                                filter_properties['request_spec']['instance_properties']['availability_zone'] = None
++                            except KeyError:
++                                pass
+                     target_cells = self._grab_target_cells(filter_properties)
+                     if target_cells is None:
+                         # a filter took care of scheduling.  skip.
+diff --git a/nova/cells/state.py b/nova/cells/state.py
+index 0b77a0b..ac0131e 100644
+--- a/nova/cells/state.py
++++ b/nova/cells/state.py
+@@ -31,8 +31,10 @@ from oslo_utils import units
+ import six
+ 
+ from nova.cells import rpc_driver
++from nova.cells import opts as cell_opts
+ from nova import context
+ from nova.db import base
++from nova.availability_zones import get_availability_zones
+ from nova import exception
+ from nova.i18n import _LE
+ from nova import objects
+@@ -65,7 +67,7 @@ class CellState(object):
+     def __init__(self, cell_name, is_me=False):
+         self.name = cell_name
+         self.is_me = is_me
+-        self.last_seen = datetime.datetime.min
++        self.last_seen = timeutils.utcnow()
+         self.capabilities = {}
+         self.capacities = {}
+         self.db_info = {}
+@@ -106,6 +108,7 @@ class CellState(object):
+             if url.hosts:
+                 for field, canonical in url_fields_to_return.items():
+                     cell_info[canonical] = getattr(url.hosts[0], field)
++        cell_info['last_seen'] = self.last_seen
+         return cell_info
+ 
+     def send_message(self, message):
+@@ -180,16 +183,6 @@ class CellStateManager(base.Base):
+                 LOG.exception(_LE('DB error'))
+                 time.sleep(30)
+ 
+-        my_cell_capabs = {}
+-        for cap in CONF.cells.capabilities:
+-            name, value = cap.split('=', 1)
+-            if ';' in value:
+-                values = set(value.split(';'))
+-            else:
+-                values = set([value])
+-            my_cell_capabs[name] = values
+-        self.my_cell_state.update_capabilities(my_cell_capabs)
+-
+     def _refresh_cells_from_dict(self, db_cells_dict):
+         """Make our cell info map match the db."""
+ 
+@@ -218,6 +211,23 @@ class CellStateManager(base.Base):
+         diff = timeutils.utcnow() - self.last_cell_db_check
+         return diff.seconds >= CONF.cells.db_check_interval
+ 
++    def _update_our_capabilities(self, ctxt=None):
++        my_cell_capabs = {}
++        for cap in CONF.cells.capabilities:
++            name, value = cap.split('=', 1)
++            if ';' in value:
++                values = set(value.split(';'))
++            else:
++                values = set([value])
++            my_cell_capabs[name] = values
++        ctxt = context.get_admin_context()
++        cell_type = cell_opts.get_cell_type()
++        if cell_type == 'compute':
++            active, disabled = get_availability_zones(ctxt)
++            # Only send up available AZs
++            my_cell_capabs['availability_zones'] = set(active)
++        self.my_cell_state.update_capabilities(my_cell_capabs)
++
+     def _update_our_capacity(self, ctxt=None):
+         """Update our capacity in the self.my_cell_state CellState.
+ 
+@@ -454,6 +464,7 @@ class CellStateManagerDB(CellStateManager):
+             db_cells_dict = {cell['name']: cell for cell in db_cells}
+             self._refresh_cells_from_dict(db_cells_dict)
+             self._update_our_capacity(ctxt)
++            self._update_our_capabilities(ctxt)
+ 
+     @sync_after
+     def cell_create(self, ctxt, values):
+@@ -494,6 +505,7 @@ class CellStateManagerFile(CellStateManager):
+         if force or self._time_to_sync():
+             self.last_cell_db_check = timeutils.utcnow()
+             self._update_our_capacity()
++            self._update_our_capabilities()
+ 
+     def cell_create(self, ctxt, values):
+         raise exception.CellsUpdateUnsupported()
+diff --git a/nova/tests/unit/api/openstack/compute/test_availability_zone.py b/nova/tests/unit/api/openstack/compute/test_availability_zone.py
+index 04c22c7..20cfb34 100644
+--- a/nova/tests/unit/api/openstack/compute/test_availability_zone.py
++++ b/nova/tests/unit/api/openstack/compute/test_availability_zone.py
+@@ -88,7 +88,7 @@ def fake_set_availability_zones(context, services):
+     return services
+ 
+ 
+-def fake_get_availability_zones(context):
++def fake_get_availability_zones(context, cells_api=None):
+     return ['nova'], []
+ 
+ 
+diff --git a/nova/tests/unit/api/openstack/compute/test_extended_availability_zone.py b/nova/tests/unit/api/openstack/compute/test_extended_availability_zone.py
+index a6e4ef3..62e2af7 100644
+--- a/nova/tests/unit/api/openstack/compute/test_extended_availability_zone.py
++++ b/nova/tests/unit/api/openstack/compute/test_extended_availability_zone.py
+@@ -64,11 +64,11 @@ def fake_compute_get_all(*args, **kwargs):
+                                             db_list, fields)
+ 
+ 
+-def fake_get_host_availability_zone(context, host):
++def fake_get_host_availability_zone(context, host, cell=None):
+     return host
+ 
+ 
+-def fake_get_no_host_availability_zone(context, host):
++def fake_get_no_host_availability_zone(context, host, cell=None):
+     return None
+ 
+ 
+@@ -154,14 +154,6 @@ class ExtendedAvailabilityZoneTestV21(test.TestCase):
+ 
+ class ExtendedAvailabilityZoneTestV2(ExtendedAvailabilityZoneTestV21):
+ 
+-    def setUp(self):
+-        super(ExtendedAvailabilityZoneTestV2, self).setUp()
+-
+-        self.flags(
+-            osapi_compute_extension=[
+-                'nova.api.openstack.compute.contrib.select_extensions'],
+-            osapi_compute_ext_list=['Extended_availability_zone'])
+-
+     def _make_request(self, url):
+         req = webob.Request.blank(url)
+         req.headers['Accept'] = self.content_type
+diff --git a/nova/tests/unit/cells/test_cells_scheduler.py b/nova/tests/unit/cells/test_cells_scheduler.py
+index a2c0c84..5cd1647 100644
+--- a/nova/tests/unit/cells/test_cells_scheduler.py
++++ b/nova/tests/unit/cells/test_cells_scheduler.py
+@@ -337,7 +337,7 @@ class CellsSchedulerTestCase(test.TestCase):
+ 
+         try:
+             self.scheduler._schedule_build_to_cells(None, None, None, _test,
+-                                                    None)
++                                                    {})
+         except test.TestingException:
+             self.fail("Scheduling did not properly short circuit")
+ 

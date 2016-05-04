@@ -1,0 +1,45 @@
+diff --git a/nova/availability_zones.py b/nova/availability_zones.py
+index dbd8697..501105e 100644
+--- a/nova/availability_zones.py
++++ b/nova/availability_zones.py
+@@ -20,7 +20,9 @@ import collections
+ from oslo_config import cfg
+ 
+ from nova import objects
++from nova.cells import opts as cell_opts
+ from nova.openstack.common import memorycache
++from nova import utils
+ 
+ # NOTE(vish): azs don't change that often, so cache them for an hour to
+ #             avoid hitting the db multiple times on every request.
+@@ -174,8 +176,14 @@ def get_instance_availability_zone(context, instance):
+         # specified one.
+         az = instance.get('availability_zone')
+         return az
+-
+-    cache_key = _make_cache_key(host)
++    cache_string = host
++    cell_type = cell_opts.get_cell_type()
++    if cell_type == 'api':
++        cell_name = str(instance.get('cell_name'))
++        if not cell_name:
++            return None
++        cache_string += cell_name
++    cache_key = _make_cache_key(cache_string)
+     cache = _get_cache()
+     az = cache.get(cache_key)
+     az_inst = instance.get('availability_zone')
+@@ -194,6 +202,12 @@ def get_instance_availability_zone(context, instance):
+         az = None
+     if not az:
+         elevated = context.elevated()
+-        az = get_host_availability_zone(elevated, host)
++        if cell_type == 'api':
++            sys_metadata = utils.instance_sys_meta(instance)
++            az = sys_metadata.get('availability_zone')
++            if not az:
++                return None
++        else:
++            az = get_host_availability_zone(elevated, host)
+         cache.set(cache_key, az, AZ_CACHE_SECONDS)
+     return az

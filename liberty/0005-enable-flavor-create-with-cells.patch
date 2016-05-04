@@ -1,0 +1,100 @@
+diff --git a/nova/cells/manager.py b/nova/cells/manager.py
+index 64dca31..f2c04c2 100644
+--- a/nova/cells/manager.py
++++ b/nova/cells/manager.py
+@@ -638,6 +638,10 @@ class CellsManager(manager.Manager):
+             ctxt, cell_name, aggregate_id, host_name)
+         return self._response_to_aggregate(response)
+ 
++    def flavor_create(self, ctxt, cell_name, values):
++        response = self.msg_runner.flavor_create(ctxt,
++                cell_name, values)
++
+     def get_keypair_at_top(self, ctxt, user_id, name):
+         responses = self.msg_runner.get_keypair_at_top(ctxt, user_id, name)
+         keypairs = [resp.value for resp in responses if resp.value is not None]
+diff --git a/nova/cells/messaging.py b/nova/cells/messaging.py
+index d92fd20..0931cb2 100644
+--- a/nova/cells/messaging.py
++++ b/nova/cells/messaging.py
+@@ -980,6 +980,11 @@ class _TargetedMessageMethods(_BaseMessageMethods):
+             message.ctxt, aggregate_id, host_name)
+         return jsonutils.to_primitive(response)
+ 
++    def flavor_create(self, message, values):
++        flavor = objects.Flavor(message.ctxt, **values)
++        flavor.create()
++        return flavor
++
+ 
+ class _BroadcastMessageMethods(_BaseMessageMethods):
+     """These are the methods that can be called as a part of a broadcast
+@@ -1925,6 +1930,12 @@ class MessageRunner(object):
+                 cell_name, need_response=True)
+         return message.process()
+ 
++    def flavor_create(self, ctxt, cell_name, values):
++        message = _TargetedMessage(self, ctxt, 'flavor_create',
++                                   dict(values=values),
++                                   'down', cell_name, need_response=True)
++        return message.process()
++
+     @staticmethod
+     def get_message_types():
+         return _CELL_MESSAGE_TYPE_TO_MESSAGE_CLS.keys()
+diff --git a/nova/cells/rpcapi.py b/nova/cells/rpcapi.py
+index b9b095d..85bd32e 100644
+--- a/nova/cells/rpcapi.py
++++ b/nova/cells/rpcapi.py
+@@ -617,6 +617,12 @@ class CellsAPI(object):
+                    backup_type=backup_type,
+                    rotation=rotation)
+ 
++    def flavor_create(self, ctxt, cell_name, values):
++        cctxt = self.client.prepare(version='1.34.1')
++        return cctxt.call(ctxt, 'flavor_create',
++                          cell_name=cell_name,
++                          values=values)
++
+     def rebuild_instance(self, ctxt, instance, new_pass, injected_files,
+                          image_ref, orig_image_ref, orig_sys_metadata, bdms,
+                          recreate=False, on_shared_storage=False, host=None,
+diff --git a/nova/compute/flavors.py b/nova/compute/flavors.py
+index 3ea9c61..9271ea1 100644
+--- a/nova/compute/flavors.py
++++ b/nova/compute/flavors.py
+@@ -27,6 +27,7 @@ from oslo_utils import strutils
+ import six
+ 
+ from nova.api.validation import parameter_types
++from nova.cells import rpcapi as cell_rpcapi
+ from nova import context
+ from nova import db
+ from nova import exception
+@@ -93,6 +94,9 @@ system_metadata_flavor_extra_props = [
+ def create(name, memory, vcpus, root_gb, ephemeral_gb=0, flavorid=None,
+            swap=0, rxtx_factor=1.0, is_public=True):
+     """Creates flavors."""
++    cell = None
++    if CONF.cells.enable and '@' in name:
++        cell, name = name.split('@')
+     if not flavorid:
+         flavorid = uuid.uuid4()
+ 
+@@ -172,9 +176,13 @@ def create(name, memory, vcpus, root_gb, ephemeral_gb=0, flavorid=None,
+     except ValueError:
+         raise exception.InvalidInput(reason=_("is_public must be a boolean"))
+ 
+-    flavor = objects.Flavor(context=context.get_admin_context(), **kwargs)
+-    flavor.create()
+-    return flavor
++    if cell:
++        cells_rpcapi = cell_rpcapi.CellsAPI()
++        return cells_rpcapi.flavor_create(context.get_admin_context(), cell, kwargs)
++    else:
++        flavor = objects.Flavor(context=context.get_admin_context(), **kwargs)
++        flavor.create()
++        return flavor
+ 
+ 
+ def destroy(name):

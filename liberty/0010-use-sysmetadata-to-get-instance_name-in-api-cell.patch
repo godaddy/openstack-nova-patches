@@ -1,0 +1,43 @@
+diff --git a/nova/api/openstack/compute/legacy_v2/contrib/extended_server_attributes.py b/nova/api/openstack/compute/legacy_v2/contrib/extended_server_attributes.py
+index 1ea5671..37957cb 100644
+--- a/nova/api/openstack/compute/legacy_v2/contrib/extended_server_attributes.py
++++ b/nova/api/openstack/compute/legacy_v2/contrib/extended_server_attributes.py
+@@ -14,14 +14,25 @@
+ 
+ """The Extended Server Attributes API extension."""
+ 
++from oslo_config import cfg
++
+ from nova.api.openstack import extensions
+ from nova.api.openstack import wsgi
++from nova import utils
++
++CONF = cfg.CONF
+ 
+ authorize = extensions.soft_extension_authorizer('compute',
+                                                  'extended_server_attributes')
+ 
+ 
+ class ExtendedServerAttributesController(wsgi.Controller):
++    def _get_hypervisor_instance_name(self, context, instance):
++        if not CONF.cells.enable:
++            return instance['name']
++        sys_metadata = utils.instance_sys_meta(instance)
++        return sys_metadata.get('instance_name', '')
++
+     def _extend_server(self, context, server, instance):
+         key = "%s:hypervisor_hostname" % Extended_server_attributes.alias
+         server[key] = instance.node
+@@ -30,9 +41,11 @@ class ExtendedServerAttributesController(wsgi.Controller):
+             if attr == 'name':
+                 key = "%s:instance_%s" % (Extended_server_attributes.alias,
+                                           attr)
++                server[key] = self._get_hypervisor_instance_name(context,
++                                                                 instance)
+             else:
+                 key = "%s:%s" % (Extended_server_attributes.alias, attr)
+-            server[key] = instance[attr]
++                server[key] = instance[attr]
+ 
+     @wsgi.extends
+     def show(self, req, resp_obj, id):

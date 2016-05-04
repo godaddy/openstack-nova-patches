@@ -1,0 +1,45 @@
+diff --git a/nova/cells/messaging.py b/nova/cells/messaging.py
+index 0931cb2..eb5f436 100644
+--- a/nova/cells/messaging.py
++++ b/nova/cells/messaging.py
+@@ -215,7 +215,7 @@ class _BaseMessage(object):
+             self.msg_runner._cleanup_response_queue(self)
+             self.resp_queue = None
+ 
+-    def _wait_for_json_responses(self, num_responses=1):
++    def _wait_for_json_responses(self, num_responses=1, cell_name=''):
+         """Wait for response(s) to be put into the eventlet queue.  Since
+         each queue entry actually contains a list of JSON-ified responses,
+         combine them all into a single list to return.
+@@ -232,7 +232,7 @@ class _BaseMessage(object):
+                 json_responses = self.resp_queue.get(timeout=wait_time)
+                 responses.extend(json_responses)
+         except queue.Empty:
+-            raise exception.CellTimeout()
++            raise exception.CellTimeout(cell_name=cell_name)
+         finally:
+             self._cleanup_response_queue()
+         return responses
+@@ -444,7 +444,8 @@ class _TargetedMessage(_BaseMessage):
+ 
+         if wait_for_response:
+             # Targeted messages only have 1 response.
+-            remote_response = self._wait_for_json_responses()[0]
++            remote_response = self._wait_for_json_responses(
++                cell_name=next_hop.name)[0]
+             return Response.from_json(self.ctxt, remote_response)
+ 
+ 
+diff --git a/nova/exception.py b/nova/exception.py
+index 5e9faef..b549aba 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -1142,7 +1142,7 @@ class CellServiceAPIMethodNotFound(NotFound):
+ 
+ 
+ class CellTimeout(NotFound):
+-    msg_fmt = _("Timeout waiting for response from cell")
++    msg_fmt = _("Timeout waiting for response from cell %(cell_name)s")
+ 
+ 
+ class CellMaxHopCountReached(NovaException):

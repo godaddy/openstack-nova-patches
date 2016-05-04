@@ -1,0 +1,207 @@
+diff --git a/nova/api/openstack/compute/legacy_v2/contrib/attach_interfaces.py b/nova/api/openstack/compute/legacy_v2/contrib/attach_interfaces.py
+index 481e1a3..8d6a778 100644
+--- a/nova/api/openstack/compute/legacy_v2/contrib/attach_interfaces.py
++++ b/nova/api/openstack/compute/legacy_v2/contrib/attach_interfaces.py
+@@ -182,6 +182,9 @@ class InterfaceAttachmentController(object):
+         except NotImplementedError:
+             msg = _("Network driver does not support this function.")
+             raise webob.exc.HTTPNotImplemented(explanation=msg)
++        except exception.InstanceInvalidState as state_error:
++            common.raise_http_conflict_for_instance_invalid_state(state_error,
++                    'detach_interface')
+ 
+         ports = data.get('ports', [])
+         results = [entity_maker(port) for port in ports]
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 63a98f3..63704be 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -3164,6 +3164,26 @@ class API(base.Base):
+                 self.volume_api.roll_detaching(context, old_volume['id'])
+                 self.volume_api.unreserve_volume(context, new_volume['id'])
+ 
++    def _attach_interface(self, context, instance, network_id, port_id,
++                         requested_ip):
++        """Use hotplug to add an network adapter to an instance.
++
++        This method is separated to make it possible for cells version
++        to override it.
++        """
++        return self.compute_rpcapi.attach_interface(context,
++            instance=instance, network_id=network_id, port_id=port_id,
++            requested_ip=requested_ip)
++
++    def _detach_interface(self, context, instance, port_id):
++        """Detach an network adapter from an instance.
++
++        This method is separated to make it possible for cells version
++        to override it.
++        """
++        self.compute_rpcapi.detach_interface(context, instance=instance,
++            port_id=port_id)
++
+     @wrap_check_policy
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
+@@ -3172,9 +3192,8 @@ class API(base.Base):
+     def attach_interface(self, context, instance, network_id, port_id,
+                          requested_ip):
+         """Use hotplug to add an network adapter to an instance."""
+-        return self.compute_rpcapi.attach_interface(context,
+-            instance=instance, network_id=network_id, port_id=port_id,
+-            requested_ip=requested_ip)
++        return self._attach_interface(context, instance=instance,
++            network_id=network_id, port_id=port_id, requested_ip=requested_ip)
+ 
+     @wrap_check_policy
+     @check_instance_lock
+@@ -3183,8 +3202,7 @@ class API(base.Base):
+                           task_state=[None])
+     def detach_interface(self, context, instance, port_id):
+         """Detach an network adapter from an instance."""
+-        self.compute_rpcapi.detach_interface(context, instance=instance,
+-            port_id=port_id)
++        self._detach_interface(context, instance=instance, port_id=port_id)
+ 
+     @wrap_check_policy
+     def get_instance_metadata(self, context, instance):
+diff --git a/nova/compute/cells_api.py b/nova/compute/cells_api.py
+index 8e939ce..850731b 100644
+--- a/nova/compute/cells_api.py
++++ b/nova/compute/cells_api.py
+@@ -435,6 +435,20 @@ class ComputeCellsAPI(compute_api.API):
+         self._cast_to_cells(context, instance, 'detach_volume',
+                 volume)
+ 
++    @check_instance_cell
++    def _attach_interface(self, context, instance, network_id, port_id,
++                         requested_ip):
++        """Use hotplug to add an network adapter to an instance."""
++        return self._call_to_cells(context, instance, 'attach_interface',
++                network_id=network_id, port_id=port_id,
++                requested_ip=requested_ip)
++
++    @check_instance_cell
++    def _detach_interface(self, context, instance, port_id):
++        """Detach an network adapter from an instance."""
++        return self._call_to_cells(context, instance, 'detach_interface',
++                port_id=port_id)
++
+     @wrap_check_policy
+     @check_instance_cell
+     def associate_floating_ip(self, context, instance, address):
+diff --git a/nova/network/base_api.py b/nova/network/base_api.py
+index 7137d4f..57bc088 100644
+--- a/nova/network/base_api.py
++++ b/nova/network/base_api.py
+@@ -238,7 +238,8 @@ class NetworkAPI(base.Base):
+         """Associate or disassociate host or project to network."""
+         raise NotImplementedError()
+ 
+-    def get_instance_nw_info(self, context, instance, **kwargs):
++    def get_instance_nw_info(self, context, instance, update_cells=False,
++                             **kwargs):
+         """Returns all network info related to an instance."""
+         with lockutils.lock('refresh_cache-%s' % instance.uuid):
+             result = self._get_instance_nw_info(context, instance, **kwargs)
+@@ -248,7 +249,7 @@ class NetworkAPI(base.Base):
+             # will happen separately.
+             update_instance_cache_with_nw_info(self, context, instance,
+                                                nw_info=result,
+-                                               update_cells=False)
++                                               update_cells=update_cells)
+         return result
+ 
+     def _get_instance_nw_info(self, context, instance, **kwargs):
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 5441f2b..5850f81 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -750,7 +750,8 @@ class API(base_api.NetworkAPI):
+             context, instance, networks=nets_in_requested_order,
+             port_ids=ports_in_requested_order,
+             admin_client=admin_client,
+-            preexisting_port_ids=preexisting_port_ids)
++            preexisting_port_ids=preexisting_port_ids,
++            update_cells=True)
+         # NOTE(danms): Only return info about ports we created in this run.
+         # In the initial allocation case, this will be everything we created,
+         # and in later runs will only be what was created that time. Thus,
+@@ -887,7 +888,7 @@ class API(base_api.NetworkAPI):
+         else:
+             self._delete_ports(neutron, instance, [port_id],
+                                raise_if_fail=True)
+-        return self.get_instance_nw_info(context, instance)
++        return self.get_instance_nw_info(context, instance, update_cells=True)
+ 
+     def list_ports(self, context, **search_opts):
+         """List ports for the client based on search options."""
+diff --git a/nova/tests/unit/compute/test_compute_api.py b/nova/tests/unit/compute/test_compute_api.py
+index 2f20e23..db7ae91 100644
+--- a/nova/tests/unit/compute/test_compute_api.py
++++ b/nova/tests/unit/compute/test_compute_api.py
+@@ -2993,6 +2993,36 @@ class _ComputeAPIUnitTestMixIn(object):
+                                                            instance, 1)
+             self.assertEqual('Server-%s' % instance.uuid, instance.hostname)
+ 
++    def _test_detach_interface_invalid_state(self, state):
++        instance = self._create_instance_obj(
++            params={'vm_state': state})
++        self.assertRaises(exception.InstanceInvalidState,
++                          self.compute_api.detach_interface,
++                          self.context, instance, '')
++
++    def test_detach_interface_invalid_state(self):
++        for state in [vm_states.BUILDING, vm_states.DELETED,
++                      vm_states.ERROR, vm_states.RESCUED,
++                      vm_states.RESIZED, vm_states.SOFT_DELETED,
++                      vm_states.SUSPENDED, vm_states.SHELVED,
++                      vm_states.SHELVED_OFFLOADED]:
++            self._test_detach_interface_invalid_state(state)
++
++    def _test_attach_interface_invalid_state(self, state):
++        instance = self._create_instance_obj(
++            params={'vm_state': state})
++        self.assertRaises(exception.InstanceInvalidState,
++                          self.compute_api.attach_interface,
++                          self.context, instance, '', '', [])
++
++    def test_attach_interface_invalid_state(self):
++        for state in [vm_states.BUILDING, vm_states.DELETED,
++                      vm_states.ERROR, vm_states.RESCUED,
++                      vm_states.RESIZED, vm_states.SOFT_DELETED,
++                      vm_states.SUSPENDED, vm_states.SHELVED,
++                      vm_states.SHELVED_OFFLOADED]:
++            self._test_attach_interface_invalid_state(state)
++
+ 
+ class ComputeAPIUnitTestCase(_ComputeAPIUnitTestMixIn, test.NoDBTestCase):
+     def setUp(self):
+diff --git a/nova/tests/unit/fake_policy.py b/nova/tests/unit/fake_policy.py
+index be87db5..0d49b5a 100644
+--- a/nova/tests/unit/fake_policy.py
++++ b/nova/tests/unit/fake_policy.py
+@@ -63,6 +63,9 @@ policy_data = """
+     "compute:attach_interface": "",
+     "compute:detach_interface": "",
+ 
++    "compute:attach_interface": "",
++    "compute:detach_interface": "",
++
+     "compute:set_admin_password": "",
+ 
+     "compute:rescue": "",
+diff --git a/nova/tests/unit/network/test_neutronv2.py b/nova/tests/unit/network/test_neutronv2.py
+index 722f036..6ee6ab9 100644
+--- a/nova/tests/unit/network/test_neutronv2.py
++++ b/nova/tests/unit/network/test_neutronv2.py
+@@ -555,7 +555,8 @@ class TestNeutronv2Base(test.TestCase):
+                                  networks=nets_in_requested_net_order,
+                                  port_ids=ports_in_requested_net_order,
+                                  admin_client=None,
+-                                 preexisting_port_ids=preexisting_port_ids
++                                 preexisting_port_ids=preexisting_port_ids,
++                                 update_cells=True
+                                 ).AndReturn(self._returned_nw_info)
+         self.mox.ReplayAll()
+         return api

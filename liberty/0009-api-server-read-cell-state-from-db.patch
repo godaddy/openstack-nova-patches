@@ -1,0 +1,192 @@
+diff --git a/nova/availability_zones.py b/nova/availability_zones.py
+index 7517841..e7c7271 100644
+--- a/nova/availability_zones.py
++++ b/nova/availability_zones.py
+@@ -22,6 +22,8 @@ from oslo_config import cfg
+ from nova import objects
+ from nova.cells import opts as cell_opts
+ from nova.cells import rpcapi as cell_rpcapi
++from nova import db
++from oslo_serialization import jsonutils
+ from nova.openstack.common import memorycache
+ from oslo_utils import timeutils
+ from nova import utils
+@@ -136,27 +138,22 @@ def get_availability_zones(context, get_only_available=False,
+     cell_type = cell_opts.get_cell_type()
+     if cell_type == 'api':
+         cache = _get_cache()
+-        available_zones = cache.get('az-availabile-list')
+-        unavailable_zones = cache.get('az-unavailabile-list')
+-
+-        if not available_zones:
+-            cells_rpcapi = cell_rpcapi.CellsAPI()
+-            cell_info = cells_rpcapi.get_cell_info_for_neighbors(context)
+-            global_azs = []
+-            mute_azs = []
+-            secs = CONF.cells.mute_child_interval
+-            for cell in cell_info:
+-                last_seen = cell['last_seen']
+-                if 'availability_zones' not in cell['capabilities']:
+-                    continue
+-                if last_seen and timeutils.is_older_than(last_seen, secs):
+-                    mute_azs.extend(cell['capabilities']['availability_zones'])
+-                else:
+-                    global_azs.extend(cell['capabilities']['availability_zones'])
+-                available_zones = list(set(global_azs))
+-                unavailable_zones = list(set(mute_azs))
+-                cache.set('az-availabile-list', available_zones, 300)
+-                cache.set('az-unavailabile-list', unavailable_zones, 300)
++
++        ctxt = context.elevated()
++        global_azs = []
++        mute_azs = []
++        secs = CONF.cells.mute_child_interval
++        for cell in db.cell_get_all(ctxt):
++            last_seen = cell.updated_at
++            capabilities = jsonutils.loads(cell.capabilities)
++            if 'availability_zones' not in capabilities:
++                continue
++            if last_seen and timeutils.is_older_than(last_seen, secs):
++                mute_azs.extend(capabilities['availability_zones'])
++            else:
++                global_azs.extend(capabilities['availability_zones'])
++            available_zones = list(set(global_azs))
++            unavailable_zones = list(set(mute_azs))
+         if get_only_available:
+             return available_zones
+         return (available_zones, unavailable_zones)
+diff --git a/nova/cells/state.py b/nova/cells/state.py
+index d05b6aa..aebab5c 100644
+--- a/nova/cells/state.py
++++ b/nova/cells/state.py
+@@ -481,6 +481,17 @@ class CellStateManagerDB(CellStateManager):
+     def cell_delete(self, ctxt, cell_name):
+         return self.db.cell_delete(ctxt, cell_name)
+ 
++    def update_cell_capabilities(self, cell_name, capabilities):
++        super(CellStateManagerDB, self).update_cell_capabilities(cell_name, capabilities)
++        # This should probably be move to the parent class, but it's
++        # not going to work for deployments using the cell state
++        # manager file class.
++        ctxt = context.get_admin_context()
++        values = {'capabilities':
++                  jsonutils.dumps(dict((capab_name, list(values))
++                                   for (capab_name, values) in capabilities.items()))}
++        self.db.cell_update(ctxt, cell_name, values)
++
+ 
+ class CellStateManagerFile(CellStateManager):
+     def __init__(self, cell_state_cls=None):
+diff --git a/nova/db/sqlalchemy/migrate_repo/versions/235_add_cells_capabilities.py b/nova/db/sqlalchemy/migrate_repo/versions/235_add_cells_capabilities.py
+new file mode 100644
+index 0000000..691f05e
+--- /dev/null
++++ b/nova/db/sqlalchemy/migrate_repo/versions/235_add_cells_capabilities.py
+@@ -0,0 +1,44 @@
++# Copyright (c) 2014 The University of Melbourne
++# All Rights Reserved
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from sqlalchemy import MetaData, Column, Table
++from sqlalchemy import Text
++
++
++def upgrade(migrate_engine):
++    """Function adds cell capabilities field."""
++    meta = MetaData(bind=migrate_engine)
++
++    cells = Table('cells', meta, autoload=True)
++    shadow_cells = Table('shadow_cells', meta, autoload=True)
++
++    capabilities = Column('capabilities', Text)
++    cells.create_column(capabilities)
++    shadow_cells.create_column(capabilities.copy())
++
++    migrate_engine.execute(cells.update().
++                           values(capabilities='{}'))
++    migrate_engine.execute(shadow_cells.update().
++                           values(capabilities='{}'))
++
++
++def downgrade(migrate_engine):
++    """Function removes cell capabilities field."""
++    meta = MetaData(bind=migrate_engine)
++    cells = Table('cells', meta, autoload=True)
++    shadow_cells = Table('shadow_cells', meta, autoload=True)
++
++    cells.c.capabilities.drop()
++    shadow_cells.c.capabilities.drop()
+diff --git a/nova/db/sqlalchemy/migrate_repo/versions/235_placeholder.py b/nova/db/sqlalchemy/migrate_repo/versions/235_placeholder.py
+deleted file mode 100644
+index 0a96cbd..0000000
+--- a/nova/db/sqlalchemy/migrate_repo/versions/235_placeholder.py
++++ /dev/null
+@@ -1,22 +0,0 @@
+-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+-#    not use this file except in compliance with the License. You may obtain
+-#    a copy of the License at
+-#
+-#         http://www.apache.org/licenses/LICENSE-2.0
+-#
+-#    Unless required by applicable law or agreed to in writing, software
+-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+-#    License for the specific language governing permissions and limitations
+-#    under the License.
+-
+-# This is a placeholder for Icehouse backports.
+-# Do not use this number for new Juno work.  New Juno work starts after
+-# all the placeholders.
+-#
+-# See blueprint backportable-db-migrations-juno
+-# http://lists.openstack.org/pipermail/openstack-dev/2013-March/006827.html
+-
+-
+-def upgrade(migrate_engine):
+-    pass
+diff --git a/nova/db/sqlalchemy/models.py b/nova/db/sqlalchemy/models.py
+index 46a4b1b..76f0488 100644
+--- a/nova/db/sqlalchemy/models.py
++++ b/nova/db/sqlalchemy/models.py
+@@ -1070,6 +1070,9 @@ class Cell(BASE, NovaBase):
+     weight_scale = Column(Float(), default=1.0)
+     is_parent = Column(Boolean())
+ 
++    # json-encode string containing the cells capabilities
++    capabilities = Column(Text, default='{}')
++
+ 
+ class AggregateHost(BASE, NovaBase):
+     """Represents a host that is member of an aggregate."""
+diff --git a/nova/tests/unit/db/test_db_api.py b/nova/tests/unit/db/test_db_api.py
+index d608bf5..089464c 100644
+--- a/nova/tests/unit/db/test_db_api.py
++++ b/nova/tests/unit/db/test_db_api.py
+@@ -7576,6 +7576,7 @@ class CellTestCase(test.TestCase, ModelsObjectComparatorMixin):
+             'weight_offset': 0.5,
+             'weight_scale': 1.5,
+             'is_parent': True,
++            'capabilities': '{}',
+         }
+ 
+     def _cell_value_modify(self, value, step):
+@@ -7615,7 +7616,7 @@ class CellTestCase(test.TestCase, ModelsObjectComparatorMixin):
+         test_cellname = self._get_cell_base_values()['name']
+         updated_cell = db.cell_update(self.ctxt, test_cellname, new_values)
+         self._assertEqualObjects(updated_cell, new_values,
+-                                 ignored_keys=self._ignored_keys + ['name'])
++                                 ignored_keys=self._ignored_keys + ['name', 'capabilities'])
+ 
+     def test_cell_delete(self):
+         new_cells = self._create_cells()

@@ -1,0 +1,748 @@
+diff --git a/nova/api/openstack/compute/legacy_v2/contrib/aggregates.py b/nova/api/openstack/compute/legacy_v2/contrib/aggregates.py
+index 4a289a4..c0725c8 100644
+--- a/nova/api/openstack/compute/legacy_v2/contrib/aggregates.py
++++ b/nova/api/openstack/compute/legacy_v2/contrib/aggregates.py
+@@ -21,7 +21,7 @@ import six
+ from webob import exc
+ 
+ from nova.api.openstack import extensions
+-from nova.compute import api as compute_api
++from nova import compute
+ from nova import context as nova_context
+ from nova import exception
+ from nova.i18n import _
+@@ -57,7 +57,7 @@ def get_host_from_body(fn):
+ class AggregateController(object):
+     """The Host Aggregates API controller for the OpenStack API."""
+     def __init__(self):
+-        self.api = compute_api.AggregateAPI()
++        self.api = compute.AggregateAPI()
+ 
+     def index(self, req):
+         """Returns a list a host aggregate's id, name, availability_zone."""
+diff --git a/nova/cells/manager.py b/nova/cells/manager.py
+index a257e1c..64dca31 100644
+--- a/nova/cells/manager.py
++++ b/nova/cells/manager.py
+@@ -584,6 +584,60 @@ class CellsManager(manager.Manager):
+     def set_admin_password(self, ctxt, instance, new_pass):
+         self.msg_runner.set_admin_password(ctxt, instance, new_pass)
+ 
++    def _response_to_aggregate(self, response):
++        aggregate = response.value_or_raise()
++        cells_utils.add_cell_to_aggregate(aggregate, response.cell_name)
++        return aggregate
++
++    def create_aggregate(self, ctxt, cell_name,
++                         aggregate_name, availability_zone):
++        response = self.msg_runner.create_aggregate(ctxt, cell_name,
++                                                    aggregate_name,
++                                                    availability_zone)
++        return self._response_to_aggregate(response)
++
++    def get_aggregate(self, ctxt, cell_name, aggregate_id):
++        response = self.msg_runner.get_aggregate(ctxt, cell_name, aggregate_id)
++        return self._response_to_aggregate(response)
++
++    def get_aggregate_list(self, ctxt):
++        responses = self.msg_runner.get_aggregate_list(ctxt)
++        result = []
++        for response in responses:
++            aggregates = response.value_or_raise()
++            for aggregate in aggregates:
++                cells_utils.add_cell_to_aggregate(
++                    aggregate, response.cell_name)
++                result.append(aggregate)
++        return result
++
++    def update_aggregate(self, ctxt, cell_name, aggregate_id, values):
++        response = self.msg_runner.update_aggregate(
++            ctxt, cell_name, aggregate_id, values)
++        return self._response_to_aggregate(response)
++
++    def update_aggregate_metadata(self, ctxt, cell_name,
++                                  aggregate_id, metadata):
++        response = self.msg_runner.update_aggregate_metadata(
++            ctxt, cell_name, aggregate_id, metadata)
++        return self._response_to_aggregate(response)
++
++    def delete_aggregate(self, ctxt, cell_name, aggregate_id):
++        response = self.msg_runner.delete_aggregate(
++            ctxt, cell_name, aggregate_id)
++        response.value_or_raise()
++
++    def add_host_to_aggregate(self, ctxt, cell_name, aggregate_id, host_name):
++        response = self.msg_runner.add_host_to_aggregate(
++            ctxt, cell_name, aggregate_id, host_name)
++        return self._response_to_aggregate(response)
++
++    def remove_host_from_aggregate(self, ctxt, cell_name,
++                                   aggregate_id, host_name):
++        response = self.msg_runner.remove_host_from_aggregate(
++            ctxt, cell_name, aggregate_id, host_name)
++        return self._response_to_aggregate(response)
++
+     def get_keypair_at_top(self, ctxt, user_id, name):
+         responses = self.msg_runner.get_keypair_at_top(ctxt, user_id, name)
+         keypairs = [resp.value for resp in responses if resp.value is not None]
+diff --git a/nova/cells/messaging.py b/nova/cells/messaging.py
+index 14e9cff..d92fd20 100644
+--- a/nova/cells/messaging.py
++++ b/nova/cells/messaging.py
+@@ -612,7 +612,8 @@ class _BaseMessageMethods(base.Base):
+         super(_BaseMessageMethods, self).__init__()
+         self.msg_runner = msg_runner
+         self.state_manager = msg_runner.state_manager
+-        self.compute_api = compute.API()
++        self.compute_api = compute.api.API()
++        self.aggregate_api = compute.api.AggregateAPI()
+         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
+         self.consoleauth_rpcapi = consoleauth_rpcapi.ConsoleAuthAPI()
+         self.host_api = compute.HostAPI()
+@@ -946,6 +947,39 @@ class _TargetedMessageMethods(_BaseMessageMethods):
+         self._call_compute_api_with_obj(message.ctxt, instance,
+                 'set_admin_password', new_pass)
+ 
++    def create_aggregate(self, message, aggregate_name, availability_zone):
++        response = self.aggregate_api.create_aggregate(
++            message.ctxt, aggregate_name, availability_zone)
++        return jsonutils.to_primitive(response)
++
++    def get_aggregate(self, message, aggregate_id):
++        response = self.aggregate_api.get_aggregate(
++            message.ctxt, aggregate_id)
++        return jsonutils.to_primitive(response)
++
++    def update_aggregate(self, message, aggregate_id, values):
++        response = self.aggregate_api.update_aggregate(
++            message.ctxt, aggregate_id, values)
++        return jsonutils.to_primitive(response)
++
++    def update_aggregate_metadata(self, message, aggregate_id, metadata):
++        response = self.aggregate_api.update_aggregate_metadata(
++            message.ctxt, aggregate_id, metadata)
++        return jsonutils.to_primitive(response)
++
++    def delete_aggregate(self, message, aggregate_id):
++        self.aggregate_api.delete_aggregate(message.ctxt, aggregate_id)
++
++    def add_host_to_aggregate(self, message, aggregate_id, host_name):
++        response = self.aggregate_api.add_host_to_aggregate(
++            message.ctxt, aggregate_id, host_name)
++        return jsonutils.to_primitive(response)
++
++    def remove_host_from_aggregate(self, message, aggregate_id, host_name):
++        response = self.aggregate_api.remove_host_from_aggregate(
++            message.ctxt, aggregate_id, host_name)
++        return jsonutils.to_primitive(response)
++
+ 
+ class _BroadcastMessageMethods(_BaseMessageMethods):
+     """These are the methods that can be called as a part of a broadcast
+@@ -1223,6 +1257,10 @@ class _BroadcastMessageMethods(_BaseMessageMethods):
+         except exception.KeypairNotFound:
+             pass
+ 
++    def get_aggregate_list(self, message):
++        response = self.aggregate_api.get_aggregate_list(message.ctxt)
++        return jsonutils.to_primitive(response)
++
+ 
+ _CELL_MESSAGE_TYPE_TO_MESSAGE_CLS = {'targeted': _TargetedMessage,
+                                      'broadcast': _BroadcastMessage,
+@@ -1825,6 +1863,68 @@ class MessageRunner(object):
+                                     need_response=True, run_locally=False)
+         return message.process()
+ 
++    def create_aggregate(self, ctxt, cell_name, aggregate_name,
++                         availability_zone):
++        method_kwargs = dict(aggregate_name=aggregate_name,
++                             availability_zone=availability_zone)
++        message = _TargetedMessage(self, ctxt, 'create_aggregate',
++                                   method_kwargs, 'down',
++                                   cell_name, need_response=True)
++        return message.process()
++
++    def get_aggregate(self, ctxt, cell_name, aggregate_id):
++        method_kwargs = dict(aggregate_id=aggregate_id)
++        message = _TargetedMessage(self, ctxt, 'get_aggregate',
++                method_kwargs, 'down',
++                cell_name, need_response=True)
++        return message.process()
++
++    def get_aggregate_list(self, ctxt):
++        message = _BroadcastMessage(self, ctxt, 'get_aggregate_list',
++                {}, 'down', need_response=True)
++        return message.process()
++
++    def update_aggregate(self, ctxt, cell_name, aggregate_id, values):
++        method_kwargs = dict(aggregate_id=aggregate_id, values=values)
++        message = _TargetedMessage(self, ctxt, 'update_aggregate',
++                method_kwargs, 'down',
++                cell_name, need_response=True)
++        return message.process()
++
++    def update_aggregate_metadata(self, ctxt, cell_name,
++                                  aggregate_id, metadata):
++        method_kwargs = dict(aggregate_id=aggregate_id, metadata=metadata)
++        message = _TargetedMessage(self, ctxt, 'update_aggregate_metadata',
++                method_kwargs, 'down',
++                cell_name, need_response=True)
++        return message.process()
++
++    def delete_aggregate(self, ctxt, cell_name, aggregate_id):
++        method_kwargs = dict(aggregate_id=aggregate_id)
++        # Need response in case the operation fails, so an exception will
++        # return
++        message = _TargetedMessage(self, ctxt, 'delete_aggregate',
++                method_kwargs, 'down',
++                cell_name, need_response=True)
++        return message.process()
++
++    def add_host_to_aggregate(self, ctxt, cell_name, aggregate_id, host_name):
++        method_kwargs = dict(aggregate_id=aggregate_id,
++                             host_name=host_name)
++        message = _TargetedMessage(self, ctxt, 'add_host_to_aggregate',
++                method_kwargs, 'down',
++                cell_name, need_response=True)
++        return message.process()
++
++    def remove_host_from_aggregate(self, ctxt, cell_name,
++                                   aggregate_id, host_name):
++        method_kwargs = dict(aggregate_id=aggregate_id,
++                             host_name=host_name)
++        message = _TargetedMessage(self, ctxt, 'remove_host_from_aggregate',
++                method_kwargs, 'down',
++                cell_name, need_response=True)
++        return message.process()
++
+     @staticmethod
+     def get_message_types():
+         return _CELL_MESSAGE_TYPE_TO_MESSAGE_CLS.keys()
+diff --git a/nova/cells/rpcapi.py b/nova/cells/rpcapi.py
+index 05dc373..b9b095d 100644
+--- a/nova/cells/rpcapi.py
++++ b/nova/cells/rpcapi.py
+@@ -643,3 +643,62 @@ class CellsAPI(object):
+             raise exception.KeypairNotFound(user_id=user_id,
+                                             name=name)
+         return keypair
++
++    def create_aggregate(self, ctxt, cell_name,
++                         aggregate_name, availability_zone):
++        cctxt = self.client.prepare(version='1.24.1')
++        return cctxt.call(ctxt, 'create_aggregate',
++                          cell_name=cell_name,
++                          aggregate_name=aggregate_name,
++                          availability_zone=availability_zone)
++
++
++    def get_aggregate(self, ctxt, cell_name, aggregate_id):
++        cctxt = self.client.prepare(version='1.24.1')
++        return cctxt.call(ctxt, 'get_aggregate',
++                          cell_name=cell_name,
++                          aggregate_id=aggregate_id)
++
++
++    def get_aggregate_list(self, ctxt):
++        cctxt = self.client.prepare(version='1.24.1')
++        return cctxt.call(ctxt, 'get_aggregate_list')
++
++
++    def update_aggregate(self, ctxt, cell_name, aggregate_id, values):
++        cctxt = self.client.prepare(version='1.24.1')
++        return cctxt.call(ctxt, 'update_aggregate', cell_name=cell_name,
++                          aggregate_id=aggregate_id,
++                          values=values)
++
++
++    def update_aggregate_metadata(self, ctxt, cell_name,
++                                  aggregate_id, metadata):
++        cctxt = self.client.prepare(version='1.24.1')
++        return cctxt.call(ctxt, 'update_aggregate_metadata',
++                          cell_name=cell_name,
++                          aggregate_id=aggregate_id,
++                          metadata=metadata)
++
++
++    def delete_aggregate(self, ctxt, cell_name, aggregate_id):
++        cctxt = self.client.prepare(version='1.24.1')
++        return cctxt.call(ctxt, 'delete_aggregate',
++                          cell_name=cell_name,
++                          aggregate_id=aggregate_id)
++
++
++    def add_host_to_aggregate(self, ctxt, cell_name, aggregate_id, host_name):
++        cctxt = self.client.prepare(version='1.24.1')
++        return cctxt.call(ctxt, 'add_host_to_aggregate',
++                          cell_name=cell_name,
++                          aggregate_id=aggregate_id, host_name=host_name)
++
++
++    def remove_host_from_aggregate(self, ctxt, cell_name,
++                                   aggregate_id, host_name):
++        cctxt = self.client.prepare(version='1.24.1')
++        return cctxt.call(ctxt, 'remove_host_from_aggregate',
++                          cell_name=cell_name,
++                          aggregate_id=aggregate_id,
++                          host_name=host_name)
+diff --git a/nova/cells/utils.py b/nova/cells/utils.py
+index f5eebf8..da4f38d 100644
+--- a/nova/cells/utils.py
++++ b/nova/cells/utils.py
+@@ -188,6 +188,15 @@ def add_cell_to_service(service, cell_name):
+     return service_proxy
+ 
+ 
++def add_cell_to_aggregate(aggregate, cell_name):
++    """Fix aggregate attributes that should be unique.
++    Changes the aggregate's name and ID to include the cell_name,
++    making them unique in the context of the api cell
++    """
++    aggregate['id'] = cell_with_item(cell_name, aggregate['id'])
++    aggregate['name'] = cell_with_item(cell_name, aggregate['name'])
++
++
+ def add_cell_to_task_log(task_log, cell_name):
+     """Fix task_log attributes that should be unique.  In particular,
+     the 'id' and 'host' fields should be prepended with cell name.
+diff --git a/nova/compute/__init__.py b/nova/compute/__init__.py
+index feb11b0..d8a65ec 100644
+--- a/nova/compute/__init__.py
++++ b/nova/compute/__init__.py
+@@ -48,6 +48,16 @@ def HostAPI(*args, **kwargs):
+     class_name = compute_api_class.__module__ + ".HostAPI"
+     return importutils.import_object(class_name, *args, **kwargs)
+ 
++def AggregateAPI(*args, **kwargs):
++    """
++    Returns the 'AggregateAPI' class from the same module as the configured
++    compute api
++    """
++    compute_api_class_name = _get_compute_api_class_name()
++    compute_api_class = importutils.import_class(compute_api_class_name)
++    class_name = compute_api_class.__module__ + ".AggregateAPI"
++    return importutils.import_object(class_name, *args, **kwargs)
++
+ 
+ def InstanceActionAPI(*args, **kwargs):
+     """Returns the 'InstanceActionAPI' class from the same module as the
+diff --git a/nova/compute/cells_api.py b/nova/compute/cells_api.py
+index 1849fb8..c8efee3 100644
+--- a/nova/compute/cells_api.py
++++ b/nova/compute/cells_api.py
+@@ -639,3 +639,51 @@ class InstanceActionAPI(compute_api.InstanceActionAPI):
+     def action_events_get(self, context, instance, action_id):
+         return self.cells_rpcapi.action_events_get(context, instance,
+                                                    action_id)
++
++
++class AggregateAPI(compute_api.AggregateAPI):
++    """Sub-set of the Compute Manager API for managing host aggregates."""
++    def __init__(self, **kwargs):
++        super(AggregateAPI, self).__init__(**kwargs)
++        self.cells_rpcapi = cells_rpcapi.CellsAPI()
++
++    def _call_rpc_api(self, context, method_name, cell_and_item,
++                                    *args, **kwargs):
++        cell, item = cells_utils.split_cell_and_item(cell_and_item)
++        try:
++            item = int(item)
++        except ValueError:
++            pass
++        method = getattr(self.cells_rpcapi, method_name)
++        return method(context, cell, item, *args, **kwargs)
++
++    def create_aggregate(self, context, aggregate_name, availability_zone):
++        return self._call_rpc_api(
++            context, 'create_aggregate', aggregate_name, availability_zone)
++
++    def get_aggregate(self, context, aggregate_id):
++        return self._call_rpc_api(
++            context, 'get_aggregate', aggregate_id)
++
++    def get_aggregate_list(self, context):
++        return self.cells_rpcapi.get_aggregate_list(context)
++
++    def update_aggregate(self, context, aggregate_id, aggregate_values):
++        return self._call_rpc_api(
++            context, 'update_aggregate', aggregate_id, aggregate_values)
++
++    def update_aggregate_metadata(self, context, aggregate_id, metadata):
++        return self._call_rpc_api(
++            context, 'update_aggregate_metadata', aggregate_id, metadata)
++
++    def delete_aggregate(self, context, aggregate_id):
++        return self._call_rpc_api(
++            context, 'delete_aggregate', aggregate_id)
++
++    def add_host_to_aggregate(self, context, aggregate_id, host_name):
++        return self._call_rpc_api(
++            context, 'add_host_to_aggregate', aggregate_id, host_name)
++
++    def remove_host_from_aggregate(self, context, aggregate_id, host_name):
++        return self._call_rpc_api(
++            context, 'remove_host_from_aggregate', aggregate_id, host_name)
+diff --git a/nova/tests/unit/cells/test_cells_manager.py b/nova/tests/unit/cells/test_cells_manager.py
+index be7e51f..f9c98ba 100644
+--- a/nova/tests/unit/cells/test_cells_manager.py
++++ b/nova/tests/unit/cells/test_cells_manager.py
+@@ -880,6 +880,66 @@ class CellsManagerClassTestCase(test.NoDBTestCase):
+             set_admin_password.assert_called_once_with(self.ctxt,
+                     'fake-instance', 'fake-password')
+ 
++    def _test_aggregate_method(self, method_name, *args, **kwargs):
++        expected_response = {"name": "fun2", "id": 42}
++        self.mox.StubOutWithMock(
++            self.cells_manager.msg_runner, method_name)
++        to_be_called = getattr(self.cells_manager.msg_runner, method_name)
++        response = self._get_fake_response(expected_response)
++        to_be_called(*args, **kwargs).AndReturn(response)
++        self.mox.ReplayAll()
++        method = getattr(self.cells_manager, method_name)
++        response = method(*args, **kwargs)
++        self.assertEqual(expected_response, response)
++
++    def test_create_aggregate(self):
++        self._test_aggregate_method('create_aggregate',
++                                    'context', 'fake_cell', 'spares', None)
++
++    def test_get_aggregate(self):
++        self._test_aggregate_method('get_aggregate', 'context',
++                                    'fake_cell', 42)
++
++    def test_get_aggregate_list(self):
++        expected_response = [{"name": "fun2", "id": 42}]
++        response = self._get_fake_response(expected_response)
++        self.mox.StubOutWithMock(
++            self.cells_manager.msg_runner, 'get_aggregate_list')
++        self.cells_manager.msg_runner.get_aggregate_list(self.ctxt).AndReturn(
++            [response])
++        self.mox.ReplayAll()
++        response = self.cells_manager.get_aggregate_list(self.ctxt)
++        self.assertEqual(expected_response, response)
++
++    def test_update_aggregate(self):
++        self._test_aggregate_method('update_aggregate', 'context',
++                                    'fake_cell', 42, {'name': 'new_name'})
++
++    def test_update_aggregate_metadata(self):
++        self._test_aggregate_method('update_aggregate_metadata', 'context',
++                                    'fake_cell', 42, {'is_spare': True})
++
++    def test_delete_aggregate(self):
++        expected_response = None
++        response = self._get_fake_response(expected_response)
++        self.mox.StubOutWithMock(
++            self.cells_manager.msg_runner, 'delete_aggregate')
++        self.cells_manager.msg_runner.delete_aggregate(
++            self.ctxt, 'some_cell', 42).AndReturn(
++            response)
++        self.mox.ReplayAll()
++        response = self.cells_manager.delete_aggregate(
++            self.ctxt, 'some_cell', 42)
++        self.assertEqual(expected_response, response)
++
++    def test_add_host_to_aggregate(self):
++        self._test_aggregate_method('add_host_to_aggregate',
++                                    'context', 'fake_cell', 42, 'fake_host')
++
++    def test_remove_host_from_aggregate(self):
++        self._test_aggregate_method('remove_host_from_aggregate',
++                                    'context', 'fake_cell', 42, 'fake_host')
++
+     def test_get_keypair_at_top(self):
+         keypairs = [self._get_fake_response('fake_keypair'),
+                     self._get_fake_response('fake_keypair2')]
+diff --git a/nova/tests/unit/cells/test_cells_messaging.py b/nova/tests/unit/cells/test_cells_messaging.py
+index de3a6dc..889bb5b 100644
+--- a/nova/tests/unit/cells/test_cells_messaging.py
++++ b/nova/tests/unit/cells/test_cells_messaging.py
+@@ -675,6 +675,7 @@ class CellsTargetedMethodsTestCase(test.TestCase):
+         self.tgt_host_api = methods_cls.host_api
+         self.tgt_db_inst = methods_cls.db
+         self.tgt_c_rpcapi = methods_cls.compute_rpcapi
++        self.tgt_a_api = methods_cls.aggregate_api
+ 
+     def test_build_instances(self):
+         build_inst_kwargs = {'filter_properties': {},
+@@ -1408,6 +1409,78 @@ class CellsTargetedMethodsTestCase(test.TestCase):
+         self._test_instance_action_method('set_admin_password', args, {}, args,
+                 {}, False)
+ 
++    def test_create_aggregate(self):
++        self.mox.StubOutWithMock(self.tgt_a_api, 'create_aggregate')
++        self.tgt_a_api.create_aggregate(
++            self.ctxt, 'aggregate_name', 'availability_zone').AndReturn(
++                'fake_response')
++        self.mox.ReplayAll()
++        response = self.src_msg_runner.create_aggregate(
++            self.ctxt, self.tgt_cell_name,
++            'aggregate_name', 'availability_zone')
++        result = response.value_or_raise()
++        self.assertEqual('fake_response', result)
++
++    def test_get_aggregate(self):
++        self.mox.StubOutWithMock(self.tgt_a_api, 'get_aggregate')
++        self.tgt_a_api.get_aggregate(
++            self.ctxt, 'aggregate_id').AndReturn('fake_response')
++        self.mox.ReplayAll()
++        response = self.src_msg_runner.get_aggregate(
++            self.ctxt, self.tgt_cell_name, 'aggregate_id')
++        result = response.value_or_raise()
++        self.assertEqual('fake_response', result)
++
++    def test_update_aggregate(self):
++        self.mox.StubOutWithMock(self.tgt_a_api, 'update_aggregate')
++        self.tgt_a_api.update_aggregate(
++            self.ctxt, 'aggregate_id', 'values').AndReturn('fake_response')
++        self.mox.ReplayAll()
++        response = self.src_msg_runner.update_aggregate(
++            self.ctxt, self.tgt_cell_name, 'aggregate_id', 'values')
++        result = response.value_or_raise()
++        self.assertEqual('fake_response', result)
++
++    def test_update_aggregate_metadata(self):
++        self.mox.StubOutWithMock(
++            self.tgt_a_api, 'update_aggregate_metadata')
++        self.tgt_a_api.update_aggregate_metadata(
++            self.ctxt, 'aggregate_id', {'is_spare': True}).AndReturn(
++                'fake_response')
++        self.mox.ReplayAll()
++        response = self.src_msg_runner.update_aggregate_metadata(
++            self.ctxt, self.tgt_cell_name, 'aggregate_id', {'is_spare': True})
++        result = response.value_or_raise()
++        self.assertEqual('fake_response', result)
++
++    def test_delete_aggregate(self):
++        self.mox.StubOutWithMock(self.tgt_a_api, 'delete_aggregate')
++        self.tgt_a_api.delete_aggregate(self.ctxt, 'aggregate_id')
++        self.mox.ReplayAll()
++        self.src_msg_runner.delete_aggregate(
++            self.ctxt, self.tgt_cell_name, 'aggregate_id')
++
++    def test_add_host_to_aggregate(self):
++        self.mox.StubOutWithMock(self.tgt_a_api, 'add_host_to_aggregate')
++        self.tgt_a_api.add_host_to_aggregate(
++            self.ctxt, 'aggregate_id', 'host_name').AndReturn('fake_response')
++        self.mox.ReplayAll()
++        response = self.src_msg_runner.add_host_to_aggregate(
++            self.ctxt, self.tgt_cell_name, 'aggregate_id', 'host_name')
++        result = response.value_or_raise()
++        self.assertEqual('fake_response', result)
++
++    def test_remove_host_from_aggregate(self):
++        self.mox.StubOutWithMock(
++            self.tgt_a_api, 'remove_host_from_aggregate')
++        self.tgt_a_api.remove_host_from_aggregate(
++            self.ctxt, 'aggregate_id', 'host_name').AndReturn('fake_response')
++        self.mox.ReplayAll()
++        response = self.src_msg_runner.remove_host_from_aggregate(
++            self.ctxt, self.tgt_cell_name, 'aggregate_id', 'host_name')
++        result = response.value_or_raise()
++        self.assertEqual('fake_response', result)
++
+ 
+ class CellsBroadcastMethodsTestCase(test.TestCase):
+     """Test case for _BroadcastMessageMethods class.  Most of these
+@@ -1436,6 +1509,7 @@ class CellsBroadcastMethodsTestCase(test.TestCase):
+         self.src_methods_cls = methods_cls
+         self.src_db_inst = methods_cls.db
+         self.src_compute_api = methods_cls.compute_api
++        self.src_aggregate_api = methods_cls.aggregate_api
+         self.src_ca_rpcapi = methods_cls.consoleauth_rpcapi
+ 
+         if not up:
+@@ -1450,6 +1524,7 @@ class CellsBroadcastMethodsTestCase(test.TestCase):
+         self.mid_methods_cls = methods_cls
+         self.mid_db_inst = methods_cls.db
+         self.mid_compute_api = methods_cls.compute_api
++        self.mid_aggregate_api = methods_cls.aggregate_api
+         self.mid_ca_rpcapi = methods_cls.consoleauth_rpcapi
+ 
+         self.tgt_msg_runner = fakes.get_message_runner(tgt_cell)
+@@ -1457,6 +1532,7 @@ class CellsBroadcastMethodsTestCase(test.TestCase):
+         self.tgt_methods_cls = methods_cls
+         self.tgt_db_inst = methods_cls.db
+         self.tgt_compute_api = methods_cls.compute_api
++        self.tgt_aggregate_api = methods_cls.aggregate_api
+         self.tgt_ca_rpcapi = methods_cls.consoleauth_rpcapi
+ 
+     def test_at_the_top(self):
+diff --git a/nova/tests/unit/cells/test_cells_rpcapi.py b/nova/tests/unit/cells/test_cells_rpcapi.py
+index faa0049..719da6d 100644
+--- a/nova/tests/unit/cells/test_cells_rpcapi.py
++++ b/nova/tests/unit/cells/test_cells_rpcapi.py
+@@ -761,6 +761,82 @@ class CellsAPITestCase(test.NoDBTestCase):
+         self._check_result(call_info, 'set_admin_password',
+                 expected_args, version='1.29')
+ 
++    def test_create_aggregate(self):
++        call_info = self._stub_rpc_method('call', 'fake_response')
++
++        self.cells_rpcapi.create_aggregate(
++            self.fake_context, 'fake_cell', 'fake_aggregate', 'fake_zone')
++
++        expected_args = {'cell_name': 'fake_cell',
++                         'aggregate_name': 'fake_aggregate',
++                         'availability_zone': 'fake_zone'}
++        self._check_result(call_info, 'create_aggregate',
++                           expected_args, version='1.24.1')
++
++    def test_get_aggregate(self):
++        call_info = self._stub_rpc_method('call', 'fake_response')
++
++        self.cells_rpcapi.get_aggregate(self.fake_context,
++                                        'fake_cell', 'fake_id')
++        expected_args = {'cell_name': 'fake_cell',
++                         'aggregate_id': 'fake_id'}
++        self._check_result(call_info, 'get_aggregate',
++                           expected_args, version='1.24.1')
++
++    def test_get_aggregate_list(self):
++        call_info = self._stub_rpc_method('call', 'fake_response')
++
++        self.cells_rpcapi.get_aggregate_list(self.fake_context)
++        expected_args = {}
++        self._check_result(call_info, 'get_aggregate_list',
++                           expected_args, version='1.24.1')
++
++    def test_update_aggregate(self):
++        call_info = self._stub_rpc_method('call', 'fake_response')
++
++        self.cells_rpcapi.update_aggregate(self.fake_context, 'fake_cell',
++                                           'fake_id', {'name': 'spares'})
++        expected_args = dict(cell_name='fake_cell', aggregate_id='fake_id',
++                             values={'name': 'spares'})
++        self._check_result(call_info, 'update_aggregate',
++                           expected_args, version='1.24.1')
++
++    def test_update_aggregate_metadata(self):
++        call_info = self._stub_rpc_method('call', 'fake_response')
++
++        self.cells_rpcapi.update_aggregate_metadata(
++            self.fake_context, 'fake_cell', 'fake_id', {'is_spare': True})
++        expected_args = dict(cell_name='fake_cell', aggregate_id='fake_id',
++                             metadata={'is_spare': True})
++        self._check_result(call_info, 'update_aggregate_metadata',
++                           expected_args, version='1.24.1')
++
++    def test_delete_aggregate(self):
++        call_info = self._stub_rpc_method('call', None)
++
++        self.cells_rpcapi.delete_aggregate(self.fake_context,
++                                           'fake_cell', 'fake_id')
++        expected_args = {'cell_name': 'fake_cell',
++                         'aggregate_id': 'fake_id'}
++        self._check_result(call_info, 'delete_aggregate',
++                           expected_args, version='1.24.1')
++
++    def add_host_to_aggregate(self, ctxt, cell_name, aggregate_id, host_name):
++        return self.call(ctxt,
++                self.make_msg('add_host_to_aggregate',
++                              cell_name=cell_name,
++                              aggregate_id=aggregate_id, host_name=host_name),
++                version='1.27')
++
++    def remove_host_from_aggregate(self, ctxt, cell_name,
++                                   aggregate_id, host_name):
++        return self.call(ctxt,
++                self.make_msg('remove_host_from_aggregate',
++                              cell_name=cell_name,
++                              aggregate_id=aggregate_id,
++                              host_name=host_name),
++                version='1.24.1')
++
+     def test_get_keypair_at_top(self):
+         call_info = self._stub_rpc_method('call', 'fake_response')
+         result = self.cells_rpcapi.get_keypair_at_top(self.fake_context,
+diff --git a/nova/tests/unit/compute/test_compute_cells.py b/nova/tests/unit/compute/test_compute_cells.py
+index 61fba9d..908e3d9 100644
+--- a/nova/tests/unit/compute/test_compute_cells.py
++++ b/nova/tests/unit/compute/test_compute_cells.py
+@@ -451,3 +451,85 @@ class CellsComputePolicyTestCase(test_compute.ComputePolicyTestCase):
+         global ORIG_COMPUTE_API
+         self.compute_api = ORIG_COMPUTE_API
+         super(CellsComputePolicyTestCase, self).tearDown()
++
++
++class AggregateAPITestCase(test_compute.BaseTestCase):
++
++    def setUp(self):
++        super(AggregateAPITestCase, self).setUp()
++        self.api = compute_cells_api.AggregateAPI()
++
++    def test_create_aggregate(self):
++        self.mox.StubOutWithMock(self.api.cells_rpcapi, 'create_aggregate')
++        self.api.cells_rpcapi.create_aggregate(
++            'context', 'fake_cell', 'aggregate_name', None).AndReturn(
++                'fake_result')
++        self.mox.ReplayAll()
++        result = self.api.create_aggregate(
++            'context', 'fake_cell@aggregate_name', None)
++        self.assertEqual('fake_result', result)
++
++    def test_get_aggregate(self):
++        self.mox.StubOutWithMock(self.api.cells_rpcapi, 'get_aggregate')
++        self.api.cells_rpcapi.get_aggregate(
++            'context', 'fake_cell', 42).AndReturn('fake_result')
++        self.mox.ReplayAll()
++        result = self.api.get_aggregate('context', 'fake_cell@42')
++        self.assertEqual('fake_result', result)
++
++    def test_get_aggregate_list(self):
++        ctxt = context.get_admin_context()
++        self.mox.StubOutWithMock(self.api.cells_rpcapi, 'get_aggregate_list')
++        self.api.cells_rpcapi.get_aggregate_list(ctxt).AndReturn(
++            ['fake', 'result'])
++        self.mox.ReplayAll()
++        result = self.api.get_aggregate_list(ctxt)
++        self.assertEqual(['fake', 'result'], result)
++
++    def test_update_aggregate(self):
++        self.mox.StubOutWithMock(self.api.cells_rpcapi, 'update_aggregate')
++        self.api.cells_rpcapi.update_aggregate(
++            'context', 'fake_cell', 42, {'name': 'spares'}).AndReturn(
++                'fake_result')
++        self.mox.ReplayAll()
++        result = self.api.update_aggregate('context', 'fake_cell@42',
++                                           {'name': 'spares'})
++        self.assertEqual('fake_result', result)
++
++    def test_update_aggregate_metadata(self):
++        self.mox.StubOutWithMock(self.api.cells_rpcapi,
++                                 'update_aggregate_metadata')
++        self.api.cells_rpcapi.update_aggregate_metadata(
++            'context', 'fake_cell', 42, {'is_spare': True}).AndReturn(
++                'fake_result')
++        self.mox.ReplayAll()
++        result = self.api.update_aggregate_metadata(
++            'context', 'fake_cell@42', {'is_spare': True})
++        self.assertEqual('fake_result', result)
++
++    def test_delete_aggregate(self):
++        self.mox.StubOutWithMock(self.api.cells_rpcapi, 'delete_aggregate')
++        self.api.cells_rpcapi.delete_aggregate(
++            'context', 'fake_cell', 42)
++        self.mox.ReplayAll()
++        self.api.delete_aggregate('context', 'fake_cell@42')
++
++    def test_add_host_to_aggregate(self):
++        self.mox.StubOutWithMock(self.api.cells_rpcapi,
++                                 'add_host_to_aggregate')
++        self.api.cells_rpcapi.add_host_to_aggregate(
++            'context', 'fake_cell', 42, 'fake_host').AndReturn('fake_result')
++        self.mox.ReplayAll()
++        result = self.api.add_host_to_aggregate('context', 'fake_cell@42',
++                                                'fake_host')
++        self.assertEqual('fake_result', result)
++
++    def test_remove_host_from_aggregate(self):
++        self.mox.StubOutWithMock(self.api.cells_rpcapi,
++                                 'remove_host_from_aggregate')
++        self.api.cells_rpcapi.remove_host_from_aggregate(
++            'context', 'fake_cell', 42, 'fake_host').AndReturn('fake_result')
++        self.mox.ReplayAll()
++        result = self.api.remove_host_from_aggregate('context', 'fake_cell@42',
++                                                     'fake_host')
++        self.assertEqual('fake_result', result)
